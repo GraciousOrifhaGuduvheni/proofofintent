@@ -1,0 +1,9 @@
+{
+  "name": "proofofintent",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "test": "pnpm -r test"
+  },
+  "engines": { "node": ">=20" }
+}
