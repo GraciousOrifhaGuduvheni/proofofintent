@@ -48,3 +48,8 @@ Expected Test Output:
 Tests: 15 pass, 15 total
 License
 Licensed under the MIT License.
+
+## License
+
+Dual-licensed: AGPL-3.0-or-later for open-source use, and a commercial license for
+closed-source use. See `LICENSE` and `COMMERCIAL.md`.

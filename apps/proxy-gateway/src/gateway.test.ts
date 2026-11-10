@@ -90,3 +90,44 @@ test("gateway forwards allowed calls and blocks violations", async () => {
   input.end();
   await done;
 });
+
+test("fail-closed hook blocks tool calls but not protocol messages", async () => {
+  const { publicKey, privateKey } = generateKeyPair();
+  const token = issueIntentToken({
+    privateKey,
+    agentId: "agent-1",
+    issuer: "user-1",
+    scope: { maxSpend: 500, currency: "USD", domains: ["airline.com"] },
+  });
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const { done } = runGateway({
+    command: process.execPath,
+    args: [fixture],
+    token,
+    publicKey,
+    input,
+    output,
+    blockAll: () => "control plane unreachable",
+  });
+  const lines = createInterface({ input: output })[Symbol.asyncIterator]();
+  const send = (o: unknown) => input.write(JSON.stringify(o) + "\n");
+  const next = async () => JSON.parse((await lines.next()).value as string);
+
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "book_flight", arguments: { url: "https://airline.com/book", amount: 1 } },
+  });
+  let r = await next();
+  assert.equal(r.error.code, POLICY_ERROR_CODE);
+  assert.match(r.error.message, /unreachable/);
+
+  send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+  r = await next();
+  assert.equal(r.result.count, 1); // the blocked call never reached the server
+
+  input.end();
+  await done;
+});

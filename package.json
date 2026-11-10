@@ -5,5 +5,8 @@
   "scripts": {
     "test": "pnpm -r test"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "AGPL-3.0-or-later"
 }

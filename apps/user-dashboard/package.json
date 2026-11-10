@@ -5,6 +5,7 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "test": "tsx --test src/server.test.ts",
+    "audit:verify": "tsx src/audit-verify.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -14,5 +15,6 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
-  }
+  },
+  "license": "AGPL-3.0-or-later"
 }

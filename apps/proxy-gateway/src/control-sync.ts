@@ -1,26 +1,36 @@
 import type { RevocationList } from "@poi/policy-engine";
 import type { SecurityEvent } from "./gateway.js";
 
+export interface ControlSyncOptions {
+  /** If set, block all tool calls when the dashboard has been unreachable this long. */
+  failClosedAfterMs?: number;
+}
+
 /**
  * Polls the dashboard for revoked token ids every 2 seconds and posts
- * security events to it. If the dashboard is unreachable the gateway keeps
- * its current revocation list (it does not fail closed).
+ * security events to it. Use the GATEWAY key here, never the admin key.
  */
 export async function startControlSync(
   baseUrl: string,
   key: string,
   revocations: RevocationList,
+  options: ControlSyncOptions = {},
 ) {
   const headers = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+  let lastOk = 0;
 
   const poll = async () => {
     try {
-      const r = await fetch(`${baseUrl}/api/revocations`, { headers });
+      const r = await fetch(`${baseUrl}/api/revocations`, {
+        headers,
+        signal: AbortSignal.timeout(3000),
+      });
       if (!r.ok) return;
       const body = (await r.json()) as { revoked?: string[] };
       for (const jti of body.revoked ?? []) revocations.revoke(jti);
+      lastOk = Date.now();
     } catch {
-      /* dashboard unreachable: keep the current list */
+      /* unreachable: lastOk stays old */
     }
   };
 
@@ -34,8 +44,14 @@ export async function startControlSync(
       method: "POST",
       headers,
       body: JSON.stringify(e),
+      signal: AbortSignal.timeout(3000),
     }).catch(() => {});
   };
 
-  return { log, stop: () => clearInterval(timer) };
+  const blockAll = (): string | null =>
+    options.failClosedAfterMs !== undefined && Date.now() - lastOk > options.failClosedAfterMs
+      ? "control plane unreachable (fail-closed)"
+      : null;
+
+  return { log, blockAll, stop: () => clearInterval(timer) };
 }

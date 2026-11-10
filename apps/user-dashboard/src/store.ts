@@ -1,3 +1,5 @@
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+
 export interface AgentRecord {
   jti: string;
   name: string;
@@ -11,19 +13,36 @@ export interface AgentRecord {
 export type AgentStatus = "active" | "revoked" | "expired";
 export type AgentView = AgentRecord & { status: AgentStatus };
 
-/** In-memory store. Restarting the server clears agents, revocations and events. */
+/** Agent and revocation state, persisted to a JSON file with atomic writes. */
 export class Store {
   private agents = new Map<string, AgentRecord>();
-  private events: Record<string, unknown>[] = [];
+
+  constructor(private filePath?: string) {
+    if (filePath && existsSync(filePath)) {
+      // A corrupt state file throws here on purpose: refuse to start
+      // rather than silently forget which tokens were revoked.
+      const data = JSON.parse(readFileSync(filePath, "utf8")) as { agents: AgentRecord[] };
+      for (const a of data.agents) this.agents.set(a.jti, a);
+    }
+  }
+
+  private save(): void {
+    if (!this.filePath) return;
+    const tmp = this.filePath + ".tmp";
+    writeFileSync(tmp, JSON.stringify({ agents: [...this.agents.values()] }), { mode: 0o600 });
+    renameSync(tmp, this.filePath);
+  }
 
   add(a: AgentRecord): void {
     this.agents.set(a.jti, a);
+    this.save();
   }
 
   revoke(jti: string): boolean {
     const a = this.agents.get(jti);
     if (!a) return false;
     a.revoked = true;
+    this.save();
     return true;
   }
 
@@ -36,6 +55,7 @@ export class Store {
         n++;
       }
     }
+    if (n > 0) this.save();
     return n;
   }
 
@@ -50,14 +70,5 @@ export class Store {
         status: (a.revoked ? "revoked" : now >= a.expiresAt ? "expired" : "active") as AgentStatus,
       }))
       .sort((x, y) => y.issuedAt - x.issuedAt);
-  }
-
-  addEvent(e: Record<string, unknown>): void {
-    this.events.push(e);
-    if (this.events.length > 500) this.events.splice(0, this.events.length - 500);
-  }
-
-  recentEvents(n: number): Record<string, unknown>[] {
-    return this.events.slice(-n).reverse();
   }
 }

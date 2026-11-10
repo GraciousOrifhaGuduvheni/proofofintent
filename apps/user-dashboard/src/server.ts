@@ -15,10 +15,12 @@ import {
   verifyIntentToken,
 } from "@poi/crypto-identity";
 import { Store } from "./store.js";
+import { AuditLog, verifyAuditFile } from "./audit.js";
 
 export interface DashboardOptions {
-  dataDir: string; // holds private.pem / public.pem
-  adminKey: string; // bearer key for every /api route
+  dataDir: string; // holds private.pem, public.pem, state.json, audit.log
+  adminKey: string; // full control: issue, revoke, read everything
+  gatewayKey: string; // gateways only: read revocations, post events
 }
 
 class HttpError extends Error {
@@ -30,10 +32,11 @@ class HttpError extends Error {
   }
 }
 
+type Role = "admin" | "gateway";
 const sha = (s: string) => createHash("sha256").update(s).digest();
 
 export function loadOrCreateKeys(dir: string): { publicKey: KeyObject; privateKey: KeyObject } {
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const privPath = join(dir, "private.pem");
   const pubPath = join(dir, "public.pem");
 
@@ -56,6 +59,7 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     "content-type": "application/json",
     "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
   });
   res.end(JSON.stringify(body));
 }
@@ -81,19 +85,50 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
+const MAX_FAILS = 10;
+const FAIL_WINDOW_MS = 60_000;
+
 export function createDashboardServer(opts: DashboardOptions) {
+  if (opts.adminKey === opts.gatewayKey) {
+    throw new Error("adminKey and gatewayKey must be different");
+  }
   const { publicKey, privateKey } = loadOrCreateKeys(opts.dataDir);
-  const store = new Store();
+  const store = new Store(join(opts.dataDir, "state.json"));
+  const auditPath = join(opts.dataDir, "audit.log");
+  const audit = new AuditLog(auditPath, privateKey, publicKey);
+
   const adminHash = sha(opts.adminKey);
+  const gatewayHash = sha(opts.gatewayKey);
   const indexUrl = new URL("../public/index.html", import.meta.url);
 
-  const authorized = (req: IncomingMessage): boolean => {
+  // Failed-auth limiter, per remote address.
+  const fails = new Map<string, { n: number; resetAt: number }>();
+  const limited = (ip: string): boolean => {
+    const f = fails.get(ip);
+    return !!f && f.n >= MAX_FAILS && Date.now() < f.resetAt;
+  };
+  const recordFail = (ip: string): void => {
+    const now = Date.now();
+    if (fails.size > 1000) fails.clear();
+    const f = fails.get(ip);
+    if (!f || now >= f.resetAt) fails.set(ip, { n: 1, resetAt: now + FAIL_WINDOW_MS });
+    else f.n++;
+  };
+
+  const roleOf = (req: IncomingMessage): Role | null => {
     const h = req.headers.authorization ?? "";
-    if (!h.startsWith("Bearer ")) return false;
-    return timingSafeEqual(sha(h.slice(7)), adminHash);
+    if (!h.startsWith("Bearer ")) return null;
+    const t = sha(h.slice(7));
+    const isAdmin = timingSafeEqual(t, adminHash);
+    const isGateway = timingSafeEqual(t, gatewayHash);
+    return isAdmin ? "admin" : isGateway ? "gateway" : null;
   };
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Blocks DNS-rebinding: only accept requests addressed to localhost.
+    const host = (req.headers.host ?? "").replace(/:\d+$/, "");
+    if (host !== "127.0.0.1" && host !== "localhost") throw new HttpError(403, "forbidden host");
+
     const url = new URL(req.url ?? "/", "http://localhost");
     const path = url.pathname;
     const method = req.method ?? "GET";
@@ -104,6 +139,8 @@ export function createDashboardServer(opts: DashboardOptions) {
         "content-security-policy":
           "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'",
         "x-frame-options": "DENY",
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
         "cache-control": "no-store",
       });
       res.end(readFileSync(indexUrl));
@@ -111,7 +148,31 @@ export function createDashboardServer(opts: DashboardOptions) {
     }
 
     if (!path.startsWith("/api/")) throw new HttpError(404, "not found");
-    if (!authorized(req)) throw new HttpError(401, "unauthorized");
+
+    const ip = req.socket.remoteAddress ?? "?";
+    if (limited(ip)) throw new HttpError(429, "too many failed attempts, try again later");
+    const role = roleOf(req);
+    if (!role) {
+      recordFail(ip);
+      throw new HttpError(401, "unauthorized");
+    }
+    const adminOnly = () => {
+      if (role !== "admin") throw new HttpError(403, "forbidden");
+    };
+
+    // ---- routes both roles may use (gateways need exactly these two)
+    if (method === "GET" && path === "/api/revocations") {
+      return send(res, 200, { revoked: store.revokedIds() });
+    }
+    if (method === "POST" && path === "/api/events") {
+      const body = await readJson(req);
+      if (JSON.stringify(body).length > 2000) throw new HttpError(413, "event too large");
+      audit.append({ ...body, source: role });
+      return send(res, 201, { ok: true });
+    }
+
+    // ---- admin only
+    adminOnly();
 
     if (method === "GET" && path === "/api/agents") {
       return send(res, 200, { agents: store.list() });
@@ -160,6 +221,14 @@ export function createDashboardServer(opts: DashboardOptions) {
         revoked: false,
       };
       store.add(record);
+      audit.append({
+        type: "agent_issued",
+        reason: `issued to ${name}`,
+        jti: record.jti,
+        domains,
+        maxSpend,
+        source: "admin",
+      });
       // The token itself is returned once and never stored.
       return send(res, 201, { token, agent: record });
     }
@@ -167,26 +236,22 @@ export function createDashboardServer(opts: DashboardOptions) {
     const m = path.match(/^\/api\/agents\/([\w-]+)\/revoke$/);
     if (method === "POST" && m) {
       if (!store.revoke(m[1])) throw new HttpError(404, "unknown agent");
+      audit.append({ type: "agent_revoked", reason: `revoked ${m[1]}`, jti: m[1], source: "admin" });
       return send(res, 200, { revoked: m[1] });
     }
 
     if (method === "POST" && path === "/api/revoke-all") {
-      return send(res, 200, { revoked: store.revokeAll() });
-    }
-
-    if (method === "GET" && path === "/api/revocations") {
-      return send(res, 200, { revoked: store.revokedIds() });
+      const n = store.revokeAll();
+      audit.append({ type: "revoke_all", reason: `revoked ${n} token(s)`, source: "admin" });
+      return send(res, 200, { revoked: n });
     }
 
     if (method === "GET" && path === "/api/events") {
-      return send(res, 200, { events: store.recentEvents(100) });
+      return send(res, 200, { events: audit.recent(100) });
     }
 
-    if (method === "POST" && path === "/api/events") {
-      const body = await readJson(req);
-      if (JSON.stringify(body).length > 2000) throw new HttpError(413, "event too large");
-      store.addEvent(body);
-      return send(res, 201, { ok: true });
+    if (method === "GET" && path === "/api/audit/verify") {
+      return send(res, 200, verifyAuditFile(auditPath, publicKey));
     }
 
     throw new HttpError(404, "not found");
@@ -200,5 +265,5 @@ export function createDashboardServer(opts: DashboardOptions) {
     });
   });
 
-  return { server, store, publicKey };
+  return { server, store, audit, publicKey };
 }

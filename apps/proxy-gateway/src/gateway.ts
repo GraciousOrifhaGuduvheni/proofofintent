@@ -6,6 +6,7 @@ import {
   evaluate,
   RevocationList,
   type JsonRpcRequest,
+  type Decision,
 } from "@poi/policy-engine";
 
 export interface SecurityEvent {
@@ -28,6 +29,8 @@ export interface GatewayOptions {
   output: Writable; // back to the agent/client
   log?: (e: SecurityEvent) => void;
   revocations?: RevocationList;
+  /** If this returns a reason, ALL tool calls are blocked (fail-closed). */
+  blockAll?: () => string | null;
 }
 
 export const POLICY_ERROR_CODE = -32001;
@@ -57,12 +60,15 @@ export function runGateway(opts: GatewayOptions): {
     if (!isRequest) return true; // client responses etc. pass through
 
     const req = item as JsonRpcRequest;
-    const d = evaluate({
-      token: opts.token,
-      publicKey: opts.publicKey,
-      request: req,
-      revocations: opts.revocations,
-    });
+    const forced = req.method === "tools/call" ? opts.blockAll?.() : null;
+    const d: Decision = forced
+      ? { allow: false, reason: forced, elapsedMs: 0 }
+      : evaluate({
+          token: opts.token,
+          publicKey: opts.publicKey,
+          request: req,
+          revocations: opts.revocations,
+        });
 
     if (req.method === "tools/call") {
       log({
