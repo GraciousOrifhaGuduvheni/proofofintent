@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POI Dashboard</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --line:#ddd; --card:#f6f6f6; --danger:#c62828; --ok:#2e7d32; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121212; --fg:#eee; --muted:#999; --line:#333; --card:#1e1e1e; --danger:#ef5350; --ok:#66bb6a; }
+  }
+  body { margin:0; font:15px system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  h2 { font-size:16px; margin:24px 0 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, button, textarea { font:inherit; padding:8px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  button { cursor:pointer; }
+  button.danger { background:var(--danger); color:#fff; border-color:var(--danger); }
+  .grow { flex:1 1 160px; }
+  table { width:100%; border-collapse:collapse; }
+  .scroll { overflow-x:auto; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:14px; }
+  .muted { color:var(--muted); }
+  .active { color:var(--ok); font-weight:600; }
+  .revoked, .blocked { color:var(--danger); font-weight:600; }
+  #token { width:100%; box-sizing:border-box; height:90px; font-family:monospace; font-size:12px; }
+  .err { color:var(--danger); min-height:1.2em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ProofOfIntent: agent control</h1>
+
+  <section id="login" class="card" hidden>
+    <div class="row">
+      <input id="keyInput" class="grow" type="password" placeholder="Admin key" autocomplete="off">
+      <button id="keyBtn">Sign in</button>
+    </div>
+    <div id="loginErr" class="err"></div>
+  </section>
+
+  <section id="app" hidden>
+    <div class="card">
+      <div class="row">
+        <input id="fName" class="grow" placeholder="Agent name">
+        <input id="fDomains" class="grow" placeholder="Allowed domains (comma separated)">
+        <input id="fSpend" type="number" min="0" placeholder="Max spend" style="width:110px">
+        <input id="fTtl" type="number" min="1" max="1440" placeholder="Minutes" value="10" style="width:90px">
+        <button id="issueBtn">Issue token</button>
+      </div>
+      <div id="issueErr" class="err"></div>
+      <div id="tokenBox" hidden>
+        <p class="muted">Copy this token now. It is shown once and not stored.</p>
+        <textarea id="token" readonly></textarea>
+      </div>
+    </div>
+
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Agents</h2>
+      <button id="revokeAllBtn" class="danger">Global Revoke</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Name</th><th>Domains</th><th>Max</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+      <tbody id="agents"></tbody>
+    </table></div>
+
+    <h2>Activity</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>Time</th><th>Event</th><th>Tool</th><th>Reason</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let key = sessionStorage.getItem("poiKey") || "";
+let timer = null;
+
+// Everything is built with textContent: agent and event data is untrusted.
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = String(text);
+  if (cls) e.className = cls;
+  return e;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({}, opts, {
+    headers: { authorization: "Bearer " + key, "content-type": "application/json" },
+  }));
+  if (r.status === 401) { signOut("Wrong key"); throw new Error("unauthorized"); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+function signOut(msg) {
+  sessionStorage.removeItem("poiKey");
+  key = "";
+  clearInterval(timer);
+  $("#app").hidden = true;
+  $("#login").hidden = false;
+  $("#loginErr").textContent = msg || "";
+}
+
+function fmt(ts) { return new Date(ts * 1000).toLocaleTimeString(); }
+
+async function refresh() {
+  try {
+    const a = await api("/api/agents");
+    const tb = $("#agents");
+    tb.replaceChildren();
+    for (const g of a.agents) {
+      const tr = el("tr");
+      tr.append(el("td", g.name), el("td", g.domains.join(", ")), el("td", g.maxSpend),
+        el("td", fmt(g.expiresAt)), el("td", g.status, g.status));
+      const td = el("td");
+      if (g.status === "active") {
+        const b = el("button", "Revoke");
+        b.onclick = async () => { await api("/api/agents/" + g.jti + "/revoke", { method: "POST" }); refresh(); };
+        td.append(b);
+      }
+      tr.append(td);
+      tb.append(tr);
+    }
+    const ev = await api("/api/events");
+    const eb = $("#events");
+    eb.replaceChildren();
+    for (const e of ev.events.slice(0, 50)) {
+      const tr = el("tr");
+      const blocked = e.type === "tool_call_blocked";
+      tr.append(el("td", e.ts ? new Date(String(e.ts)).toLocaleTimeString() : ""),
+        el("td", e.type || "", blocked ? "blocked" : ""),
+        el("td", e.tool || ""), el("td", e.reason || ""));
+      eb.append(tr);
+    }
+  } catch (e) { /* a 401 is handled in api() */ }
+}
+
+function start() {
+  $("#login").hidden = true;
+  $("#app").hidden = false;
+  refresh();
+  timer = setInterval(refresh, 3000);
+}
+
+$("#keyBtn").onclick = async () => {
+  key = $("#keyInput").value.trim();
+  try {
+    await api("/api/agents");
+    sessionStorage.setItem("poiKey", key);
+    start();
+  } catch (e) { /* signOut already showed the message */ }
+};
+
+$("#issueBtn").onclick = async () => {
+  $("#issueErr").textContent = "";
+  try {
+    const out = await api("/api/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: $("#fName").value,
+        domains: $("#fDomains").value.split(","),
+        maxSpend: Number($("#fSpend").value || 0),
+        ttlSeconds: Math.round(Number($("#fTtl").value || 10) * 60),
+      }),
+    });
+    $("#token").value = out.token;
+    $("#tokenBox").hidden = false;
+    refresh();
+  } catch (e) { $("#issueErr").textContent = e.message; }
+};
+
+$("#revokeAllBtn").onclick = async () => {
+  if (!confirm("Revoke ALL agent tokens now?")) return;
+  await api("/api/revoke-all", { method: "POST" });
+  refresh();
+};
+
+if (key) { api("/api/agents").then(start).catch(() => {}); } else { signOut(""); }
+</script>
+</body>
+</html>
