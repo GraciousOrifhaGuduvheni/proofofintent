@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
-    "test": "tsx --test src/server.test.ts",
+    "test": "tsx --test src/*.test.ts",
     "audit:verify": "tsx src/audit-verify.ts",
     "typecheck": "tsc --noEmit"
   },

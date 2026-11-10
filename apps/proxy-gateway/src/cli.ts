@@ -25,7 +25,9 @@ if (!command || !token || !keyFile) {
 const publicKey = createPublicKey(readFileSync(keyFile));
 const revocations = new RevocationList();
 
-let log = (e: SecurityEvent) => process.stderr.write(JSON.stringify(e) + "\n");
+let log: (e: SecurityEvent) => void = (e) => {
+  process.stderr.write(JSON.stringify(e) + "\n");
+};
 let blockAll: (() => string | null) | undefined;
 
 if (controlUrl && gatewayKey) {

@@ -72,6 +72,8 @@ export interface EvaluateInput {
   publicKey: KeyObject;
   request: JsonRpcRequest;
   revocations?: RevocationList;
+  /** If given, enforces a cumulative budget per token on top of the per-call limit. */
+  spend?: SpendTracker;
 }
 
 /** Decide whether one MCP request may proceed. Deny by default. */
@@ -103,5 +105,33 @@ export function evaluate(input: EvaluateInput): Decision {
   }
 
   const c = checkAction(v.claims, action);
-  return c.allowed ? done(true, "within scope", v.claims) : done(false, c.reason, v.claims);
+  if (!c.allowed) return done(false, c.reason, v.claims);
+
+  if (input.spend && action.amount) {
+    const total = input.spend.spent(v.claims.jti) + action.amount;
+    if (total > v.claims.scope.maxSpend) {
+      return done(
+        false,
+        `cumulative spend ${total} would exceed budget ${v.claims.scope.maxSpend}`,
+        v.claims,
+      );
+    }
+    // Recorded when allowed, even if the downstream call later fails (conservative).
+    input.spend.record(v.claims.jti, action.amount);
+  }
+  return done(true, "within scope", v.claims);
+}
+
+/**
+ * Cumulative spend per token id. In memory: it resets if the process restarts
+ * and is not shared between gateways (see docs/THREAT_MODEL.md).
+ */
+export class SpendTracker {
+  private totals = new Map<string, number>();
+  spent(jti: string): number {
+    return this.totals.get(jti) ?? 0;
+  }
+  record(jti: string, amount: number): void {
+    this.totals.set(jti, this.spent(jti) + amount);
+  }
 }

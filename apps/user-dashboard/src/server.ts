@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { readFileSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import {
   createHash,
@@ -21,6 +21,7 @@ export interface DashboardOptions {
   dataDir: string; // holds private.pem, public.pem, state.json, audit.log
   adminKey: string; // full control: issue, revoke, read everything
   gatewayKey: string; // gateways only: read revocations, post events
+  keyPassphrase?: string; // if set, private.pem is encrypted at rest
 }
 
 class HttpError extends Error {
@@ -35,21 +36,38 @@ class HttpError extends Error {
 type Role = "admin" | "gateway";
 const sha = (s: string) => createHash("sha256").update(s).digest();
 
-export function loadOrCreateKeys(dir: string): { publicKey: KeyObject; privateKey: KeyObject } {
+export function loadOrCreateKeys(
+  dir: string,
+  passphrase?: string,
+): { publicKey: KeyObject; privateKey: KeyObject } {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const privPath = join(dir, "private.pem");
   const pubPath = join(dir, "public.pem");
 
+  // Write to a temp file then rename, so a crash can never leave a half-written key.
+  const writePrivate = (key: KeyObject) => {
+    const pem = passphrase
+      ? key.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase })
+      : key.export({ type: "pkcs8", format: "pem" });
+    const tmp = privPath + ".tmp";
+    writeFileSync(tmp, pem as string, { mode: 0o600 });
+    renameSync(tmp, privPath);
+  };
+
   let privateKey: KeyObject;
   let publicKey: KeyObject;
   if (existsSync(privPath)) {
-    privateKey = createPrivateKey(readFileSync(privPath));
+    const pem = readFileSync(privPath, "utf8");
+    const encrypted = pem.includes("ENCRYPTED");
+    if (encrypted && !passphrase) {
+      throw new Error("private key is encrypted: set POI_KEY_PASSPHRASE");
+    }
+    privateKey = createPrivateKey(encrypted ? { key: pem, passphrase } : pem);
     publicKey = createPublicKey(privateKey);
+    if (passphrase && !encrypted) writePrivate(privateKey); // migrate a plaintext key
   } else {
     ({ publicKey, privateKey } = generateKeyPair());
-    writeFileSync(privPath, privateKey.export({ type: "pkcs8", format: "pem" }) as string, {
-      mode: 0o600,
-    });
+    writePrivate(privateKey);
   }
   writeFileSync(pubPath, publicKey.export({ type: "spki", format: "pem" }) as string);
   return { publicKey, privateKey };
@@ -92,7 +110,7 @@ export function createDashboardServer(opts: DashboardOptions) {
   if (opts.adminKey === opts.gatewayKey) {
     throw new Error("adminKey and gatewayKey must be different");
   }
-  const { publicKey, privateKey } = loadOrCreateKeys(opts.dataDir);
+  const { publicKey, privateKey } = loadOrCreateKeys(opts.dataDir, opts.keyPassphrase);
   const store = new Store(join(opts.dataDir, "state.json"));
   const auditPath = join(opts.dataDir, "audit.log");
   const audit = new AuditLog(auditPath, privateKey, publicKey);

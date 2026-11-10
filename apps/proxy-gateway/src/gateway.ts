@@ -7,6 +7,7 @@ import {
   RevocationList,
   type JsonRpcRequest,
   type Decision,
+  SpendTracker,
 } from "@poi/policy-engine";
 
 export interface SecurityEvent {
@@ -31,6 +32,8 @@ export interface GatewayOptions {
   revocations?: RevocationList;
   /** If this returns a reason, ALL tool calls are blocked (fail-closed). */
   blockAll?: () => string | null;
+  /** Cumulative spend per token. A fresh tracker is used if omitted. */
+  spend?: SpendTracker;
 }
 
 export const POLICY_ERROR_CODE = -32001;
@@ -40,6 +43,7 @@ export function runGateway(opts: GatewayOptions): {
   done: Promise<number | null>;
 } {
   const log = opts.log ?? (() => {});
+  const spend = opts.spend ?? new SpendTracker();
   // stdout is the protocol channel, so the server's stderr goes straight through.
   const child = spawn(opts.command, opts.args, {
     stdio: ["pipe", "pipe", "inherit"],
@@ -68,6 +72,7 @@ export function runGateway(opts: GatewayOptions): {
           publicKey: opts.publicKey,
           request: req,
           revocations: opts.revocations,
+          spend,
         });
 
     if (req.method === "tools/call") {
